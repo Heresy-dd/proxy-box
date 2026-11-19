@@ -81,7 +81,8 @@ func (s *Store) migrate() error {
 		is_favorite INTEGER DEFAULT 0,
 		last_delay INTEGER DEFAULT 0,
 		last_checked_at DATETIME,
-		active INTEGER DEFAULT 1
+		active INTEGER DEFAULT 1,
+		pending_confirmation INTEGER DEFAULT 0
 	);
 
 	CREATE INDEX IF NOT EXISTS idx_nodes_sub ON nodes(subscription_id);
@@ -118,7 +119,11 @@ func (s *Store) migrate() error {
 	);
 	`
 	_, err := s.db.Exec(schema)
-	return err
+	if err != nil {
+		return err
+	}
+	_, _ = s.db.Exec("ALTER TABLE nodes ADD COLUMN pending_confirmation INTEGER DEFAULT 0;")
+	return nil
 }
 
 // --- Subscriptions ---
@@ -257,65 +262,233 @@ func (s *Store) DeleteSubscription(id string) error {
 
 // --- Nodes & Pools ---
 
-// UpsertNodes merges parsed nodes into DB while preserving pool classification, order, favorites, and delays
-func (s *Store) UpsertNodes(subID, subName string, freshNodes []*model.Node) error {
+// UpsertNodes merges parsed nodes into DB while preserving pool classification, order, favorites, delays, and chain references.
+// It matches existing nodes by exact ID, exact original_name, server:port, or normalized name (handling cnix/prefix changes).
+func (s *Store) UpsertNodes(subID, subName string, freshNodes []*model.Node) (*model.MigrationReport, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	report := &model.MigrationReport{
+		TotalParsed: len(freshNodes),
+	}
+
 	tx, err := s.db.Begin()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer tx.Rollback()
 
-	// Mark all existing nodes of this subscription as temporarily inactive
-	if _, err := tx.Exec(`UPDATE nodes SET active = 0 WHERE subscription_id = ?`, subID); err != nil {
-		return err
+	// 1. Fetch all existing nodes for this subscription
+	rows, err := tx.Query(`
+		SELECT id, original_name, server, port, pool, order_num, is_favorite, last_delay, active
+		FROM nodes
+		WHERE subscription_id = ?
+	`, subID)
+	if err != nil {
+		return nil, err
 	}
+
+	type existingNodeInfo struct {
+		ID           string
+		OriginalName string
+		Server       string
+		Port         int
+		Pool         model.PoolType
+		Order        int
+		IsFavorite   bool
+		LastDelay    int
+		Active       bool
+	}
+
+	var existingList []*existingNodeInfo
+	existingByID := make(map[string]*existingNodeInfo)
+	existingByExactName := make(map[string][]*existingNodeInfo)
+	existingByServerPort := make(map[string][]*existingNodeInfo)
+	existingByNormName := make(map[string][]*existingNodeInfo)
+
+	for rows.Next() {
+		var en existingNodeInfo
+		var poolStr string
+		var fav, act int
+		if err := rows.Scan(&en.ID, &en.OriginalName, &en.Server, &en.Port, &poolStr, &en.Order, &fav, &en.LastDelay, &act); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		en.Pool = model.PoolType(poolStr)
+		en.IsFavorite = fav == 1
+		en.Active = act == 1
+
+		existingList = append(existingList, &en)
+		existingByID[en.ID] = &en
+		existingByExactName[en.OriginalName] = append(existingByExactName[en.OriginalName], &en)
+		spKey := fmt.Sprintf("%s:%d", en.Server, en.Port)
+		existingByServerPort[spKey] = append(existingByServerPort[spKey], &en)
+		norm := model.NormalizeNodeName(en.OriginalName)
+		existingByNormName[norm] = append(existingByNormName[norm], &en)
+	}
+	rows.Close()
+
+	matchedOldIDs := make(map[string]bool)
+
+	updateStmt, err := tx.Prepare(`
+		UPDATE nodes SET
+			sub_name = ?,
+			original_name = ?,
+			name = ?,
+			type = ?,
+			server = ?,
+			port = ?,
+			raw_config = ?,
+			active = 1,
+			pending_confirmation = ?
+		WHERE id = ?
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer updateStmt.Close()
 
 	insertStmt, err := tx.Prepare(`
 		INSERT INTO nodes (
 			id, subscription_id, sub_name, original_name, name, type,
 			server, port, raw_config, pool, order_num, is_favorite,
-			last_delay, last_checked_at, active
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(id) DO UPDATE SET
-			sub_name = excluded.sub_name,
-			original_name = excluded.original_name,
-			name = excluded.name,
-			type = excluded.type,
-			server = excluded.server,
-			port = excluded.port,
-			raw_config = excluded.raw_config,
-			active = 1
+			last_delay, last_checked_at, active, pending_confirmation
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer insertStmt.Close()
 
-	for _, n := range freshNodes {
-		rawJSON, err := json.Marshal(n.RawConfig)
+	for _, fresh := range freshNodes {
+		rawJSON, err := json.Marshal(fresh.RawConfig)
 		if err != nil {
 			continue
 		}
 
-		fav := 0
-		if n.IsFavorite {
-			fav = 1
+		var matched *existingNodeInfo
+
+		// Priority 1: Exact ID match
+		if old, exists := existingByID[fresh.ID]; exists && !matchedOldIDs[old.ID] {
+			matched = old
 		}
 
-		_, err = insertStmt.Exec(
-			n.ID, subID, subName, n.OriginalName, n.Name, n.Type,
-			n.Server, n.Port, string(rawJSON), string(model.PoolUnassigned),
-			n.Order, fav, n.LastDelay, n.LastCheckedAt, 1,
-		)
-		if err != nil {
-			return err
+		// Priority 2: Exact OriginalName match (must be unique among unmatched)
+		if matched == nil {
+			candidates := existingByExactName[fresh.OriginalName]
+			var unmatched []*existingNodeInfo
+			for _, c := range candidates {
+				if !matchedOldIDs[c.ID] {
+					unmatched = append(unmatched, c)
+				}
+			}
+			if len(unmatched) == 1 {
+				matched = unmatched[0]
+			}
+		}
+
+		// Priority 3: Exact Server:Port match (must be unique among unmatched)
+		if matched == nil {
+			spKey := fmt.Sprintf("%s:%d", fresh.Server, fresh.Port)
+			candidates := existingByServerPort[spKey]
+			var unmatched []*existingNodeInfo
+			for _, c := range candidates {
+				if !matchedOldIDs[c.ID] {
+					unmatched = append(unmatched, c)
+				}
+			}
+			if len(unmatched) == 1 {
+				matched = unmatched[0]
+			}
+		}
+
+		// Priority 4: Normalized name match (e.g. "CNIX专线 · 澳门（动态家庭） X3" vs "澳门（动态家庭）X2.5")
+		if matched == nil {
+			norm := model.NormalizeNodeName(fresh.OriginalName)
+			candidates := existingByNormName[norm]
+			var unmatched []*existingNodeInfo
+			for _, c := range candidates {
+				if !matchedOldIDs[c.ID] {
+					unmatched = append(unmatched, c)
+				}
+			}
+			if len(unmatched) == 1 {
+				matched = unmatched[0]
+			}
+		}
+
+		if matched != nil {
+			// Inherit old node's ID, pool, order, favorite!
+			matchedOldIDs[matched.ID] = true
+			fresh.ID = matched.ID
+			fresh.Pool = matched.Pool
+			fresh.Order = matched.Order
+			fresh.IsFavorite = matched.IsFavorite
+			fresh.PendingConfirmation = false
+
+			_, err = updateStmt.Exec(
+				subName, fresh.OriginalName, fresh.Name, fresh.Type,
+				fresh.Server, fresh.Port, string(rawJSON), 0, matched.ID,
+			)
+			if err != nil {
+				return nil, err
+			}
+			report.Inherited++
+			report.Details = append(report.Details, fmt.Sprintf("继承: [%s] -> ID: %s (池: %s)", fresh.OriginalName, matched.ID, matched.Pool))
+		} else {
+			// Check if there was an ambiguous conflict (multiple unmatched candidates)
+			candidates := existingByExactName[fresh.OriginalName]
+			isConflict := len(candidates) > 1
+
+			if fresh.ID == "" {
+				fresh.ID = model.GenerateStableNodeID(subID, fresh.OriginalName, fresh.Server, fresh.Port)
+			}
+			// In case of conflict with an already-matched ID, generate unique suffix
+			if matchedOldIDs[fresh.ID] {
+				fresh.ID = fmt.Sprintf("%s_%d", fresh.ID, time.Now().UnixNano()%10000)
+			}
+
+			fresh.Pool = model.PoolUnassigned
+			fresh.PendingConfirmation = isConflict
+			pendingVal := 0
+			if isConflict {
+				pendingVal = 1
+				report.Conflicts++
+				report.Details = append(report.Details, fmt.Sprintf("待确认(重名冲突): [%s] -> 新分配 ID: %s", fresh.OriginalName, fresh.ID))
+			} else {
+				report.Added++
+				report.Details = append(report.Details, fmt.Sprintf("新增: [%s] -> ID: %s", fresh.OriginalName, fresh.ID))
+			}
+
+			fav := 0
+			if fresh.IsFavorite {
+				fav = 1
+			}
+
+			_, err = insertStmt.Exec(
+				fresh.ID, subID, subName, fresh.OriginalName, fresh.Name, fresh.Type,
+				fresh.Server, fresh.Port, string(rawJSON), string(model.PoolUnassigned),
+				fresh.Order, fav, fresh.LastDelay, fresh.LastCheckedAt, 1, pendingVal,
+			)
+			if err != nil {
+				return nil, err
+			}
 		}
 	}
 
-	return tx.Commit()
+	// 5. Any existing nodes that were NOT matched are marked inactive (失效)
+	for _, old := range existingList {
+		if !matchedOldIDs[old.ID] {
+			_, err = tx.Exec(`UPDATE nodes SET active = 0 WHERE id = ?`, old.ID)
+			if err != nil {
+				return nil, err
+			}
+			report.Deprecated++
+			report.Details = append(report.Details, fmt.Sprintf("失效: [%s] (ID: %s, 原池: %s)", old.OriginalName, old.ID, old.Pool))
+		}
+	}
+
+	return report, tx.Commit()
 }
 
 func (s *Store) ListNodes(pool model.PoolType, subID string, search string) ([]*model.Node, error) {
@@ -325,7 +498,7 @@ func (s *Store) ListNodes(pool model.PoolType, subID string, search string) ([]*
 	query := `
 		SELECT id, subscription_id, sub_name, original_name, name, type,
 		       server, port, raw_config, pool, order_num, is_favorite,
-		       last_delay, last_checked_at, active
+		       last_delay, last_checked_at, active, pending_confirmation
 		FROM nodes
 		WHERE active = 1
 	`
@@ -357,19 +530,20 @@ func (s *Store) ListNodes(pool model.PoolType, subID string, search string) ([]*
 	for rows.Next() {
 		var n model.Node
 		var rawConfigStr string
-		var fav, act int
+		var fav, act, pend int
 		var lastChecked sql.NullTime
 
 		if err := rows.Scan(
 			&n.ID, &n.SubscriptionID, &n.SubName, &n.OriginalName, &n.Name, &n.Type,
 			&n.Server, &n.Port, &rawConfigStr, &n.Pool, &n.Order, &fav,
-			&n.LastDelay, &lastChecked, &act,
+			&n.LastDelay, &lastChecked, &act, &pend,
 		); err != nil {
 			return nil, err
 		}
 
 		n.IsFavorite = fav == 1
 		n.Active = act == 1
+		n.PendingConfirmation = pend == 1
 		if lastChecked.Valid {
 			n.LastCheckedAt = lastChecked.Time
 		}
@@ -387,24 +561,25 @@ func (s *Store) GetNode(id string) (*model.Node, error) {
 	row := s.db.QueryRow(`
 		SELECT id, subscription_id, sub_name, original_name, name, type,
 		       server, port, raw_config, pool, order_num, is_favorite,
-		       last_delay, last_checked_at, active
+		       last_delay, last_checked_at, active, pending_confirmation
 		FROM nodes WHERE id = ?
 	`, id)
 
 	var n model.Node
 	var rawConfigStr string
-	var fav, act int
+	var fav, act, pend int
 	var lastChecked sql.NullTime
 
 	if err := row.Scan(
 		&n.ID, &n.SubscriptionID, &n.SubName, &n.OriginalName, &n.Name, &n.Type,
 		&n.Server, &n.Port, &rawConfigStr, &n.Pool, &n.Order, &fav,
-		&n.LastDelay, &lastChecked, &act,
+		&n.LastDelay, &lastChecked, &act, &pend,
 	); err != nil {
 		return nil, err
 	}
 	n.IsFavorite = fav == 1
 	n.Active = act == 1
+	n.PendingConfirmation = pend == 1
 	if lastChecked.Valid {
 		n.LastCheckedAt = lastChecked.Time
 	}
@@ -577,14 +752,62 @@ func (s *Store) ListChains() ([]*model.Chain, error) {
 	// Populate joined nodes
 	for _, c := range chains {
 		if c.LandingNodeID != "" {
-			c.LandingNode, _ = s.GetNode(c.LandingNodeID)
+			ln, err := s.GetNode(c.LandingNodeID)
+			if err != nil || ln == nil {
+				c.LandingNodeStatus = "missing"
+				c.LandingNode = &model.Node{
+					ID:           c.LandingNodeID,
+					Name:         "[节点缺失: " + c.LandingNodeID + "]",
+					OriginalName: "[节点缺失: " + c.LandingNodeID + "]",
+					Pool:         model.PoolLanding,
+				}
+			} else {
+				c.LandingNode = ln
+				if ln.Pool != model.PoolLanding {
+					c.LandingNodeStatus = "invalid_pool"
+				} else {
+					c.LandingNodeStatus = "ok"
+				}
+			}
 		}
-		if c.FrontendNodeID != nil && *c.FrontendNodeID != "" {
-			c.FrontendNode, _ = s.GetNode(*c.FrontendNodeID)
+
+		if c.FrontendNodeID == nil || *c.FrontendNodeID == "" {
+			c.FrontendNodeStatus = "direct"
+		} else {
+			fn, err := s.GetNode(*c.FrontendNodeID)
+			if err != nil || fn == nil {
+				c.FrontendNodeStatus = "missing"
+				c.FrontendNode = &model.Node{
+					ID:           *c.FrontendNodeID,
+					Name:         "[节点缺失: " + *c.FrontendNodeID + "]",
+					OriginalName: "[节点缺失: " + *c.FrontendNodeID + "]",
+					Pool:         model.PoolFrontend,
+				}
+			} else {
+				c.FrontendNode = fn
+				if fn.Pool != model.PoolFrontend {
+					c.FrontendNodeStatus = "invalid_pool"
+				} else {
+					c.FrontendNodeStatus = "ok"
+				}
+			}
 		}
 	}
 
 	return chains, nil
+}
+
+func (s *Store) GetChain(id string) (*model.Chain, error) {
+	chains, err := s.ListChains()
+	if err != nil {
+		return nil, err
+	}
+	for _, c := range chains {
+		if c.ID == id {
+			return c, nil
+		}
+	}
+	return nil, fmt.Errorf("chain %s not found", id)
 }
 
 func (s *Store) DeleteChain(id string) error {

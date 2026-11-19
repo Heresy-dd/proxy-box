@@ -3,10 +3,17 @@ package api
 import (
 	"encoding/json"
 	"net/http"
+	"regexp"
 
 	"proxybox/internal/service"
 	"proxybox/internal/store"
 )
+
+var sensitiveRegex = regexp.MustCompile(`(?i)(password|secret|token|bearer\s+)[:=\s"]+([^\s"&,]+)`)
+
+func MaskSensitive(text string) string {
+	return sensitiveRegex.ReplaceAllString(text, `$1: "***"`)
+}
 
 type SettingsHandler struct {
 	store        *store.Store
@@ -55,8 +62,12 @@ func (h *SettingsHandler) SaveSettings(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *SettingsHandler) GetLogs(w http.ResponseWriter, r *http.Request) {
-	logs := h.applyService.GetRunner().GetRecentLogs()
+	rawLogs := h.applyService.GetRunner().GetRecentLogs()
+	maskedLogs := make([]string, len(rawLogs))
+	for i, l := range rawLogs {
+		maskedLogs[i] = MaskSensitive(l)
+	}
 	jsonResponse(w, map[string]interface{}{
-		"logs": logs,
+		"logs": maskedLogs,
 	})
 }

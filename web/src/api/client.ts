@@ -1,4 +1,4 @@
-import { Subscription, Node, Chain, ConfigDiff, SpeedtestResult, PoolType } from '../types';
+import { Subscription, Node, Chain, ConfigDiff, SpeedtestResult, SpeedtestItemResult, SpeedtestJobResponse, ChainDiagnosis, PoolType } from '../types';
 import { mockSubscriptions, mockNodes, mockChains, mockDiff } from '../mock/mockData';
 
 const BASE_URL = '/api';
@@ -90,6 +90,48 @@ export class ApiClient {
     }
     if (endpoint === '/apply/diff') {
       return Promise.resolve({ ...mockDiff } as any);
+    }
+    if (endpoint.includes('/diagnose')) {
+      return Promise.resolve({
+        chain_id: 'mock_chain',
+        frontend_ok: true,
+        frontend_delay: 850,
+        frontend_status: 'ok',
+        landing_ok: true,
+        landing_delay: 950,
+        landing_status: 'ok',
+        chain_ok: true,
+        chain_delay: 1100,
+        port_ok: true,
+        egress_ip: '45.144.136.21',
+        egress_country: 'Macao',
+        diagnosis_summary: '链路健康可用，出口 IP: 45.144.136.21 (Macao)',
+        suggested_action: '链路状态良好，可在指纹浏览器中正常使用',
+      } as any);
+    }
+    if (endpoint === '/speedtest/jobs') {
+      return Promise.resolve({ job_id: 'mock_job_1', total: mockNodes.filter(n => n.pool === 'landing').length, status: 'running' } as any);
+    }
+    if (endpoint.startsWith('/speedtest/jobs/')) {
+      const landingNodes = mockNodes.filter(n => n.pool === 'landing');
+      return Promise.resolve({
+        job_id: 'mock_job_1',
+        status: 'finished',
+        total: landingNodes.length,
+        completed: landingNodes.length,
+        last_seq: landingNodes.length,
+        results: landingNodes.map((n, idx) => ({
+          seq: idx + 1,
+          type: 'landing_delay',
+          node_id: n.id,
+          original_name: n.original_name,
+          delay: Math.floor(Math.random() * 300) + 150,
+          frontend_delay: 850,
+          status: 'SUCCESS',
+          status_label: '可链式',
+          timestamp: Date.now(),
+        })),
+      } as any);
     }
     if (endpoint === '/settings') {
       return Promise.resolve({
@@ -204,6 +246,93 @@ export class ApiClient {
 
   static async detectEgress(id: string): Promise<{ ip: string; country: string }> {
     return this.request<{ ip: string; country: string }>(`/chains/${id}/egress-check`, { method: 'POST' });
+  }
+
+  static async diagnoseChain(id: string): Promise<ChainDiagnosis> {
+    return this.request<ChainDiagnosis>(`/chains/${id}/diagnose`, { method: 'POST' });
+  }
+
+  // --- Speedtest Job & Polling ---
+  static async createSpeedtestJob(
+    frontID: string,
+    landingIDs?: string[],
+    url?: string,
+    timeout?: number,
+    concurrency?: number,
+  ): Promise<{ job_id: string; total: number; status: string }> {
+    return this.request<{ job_id: string; total: number; status: string }>('/speedtest/jobs', {
+      method: 'POST',
+      body: JSON.stringify({
+        front_id: frontID,
+        landing_ids: landingIDs || [],
+        url: url || '',
+        timeout: timeout || 5,
+        concurrency: concurrency || 10,
+      }),
+    });
+  }
+
+  static async getSpeedtestJob(jobID: string, sinceSeq: number = 0): Promise<SpeedtestJobResponse> {
+    return this.request<SpeedtestJobResponse>(`/speedtest/jobs/${jobID}?since=${sinceSeq}`);
+  }
+
+  static runSpeedtestJob(
+    frontID: string,
+    landingIDs: string[] | undefined,
+    onResult: (res: SpeedtestItemResult) => void,
+    onComplete: () => void,
+    onError: (err: string) => void,
+  ): () => void {
+    let active = true;
+    let pollTimer: any = null;
+
+    (async () => {
+      try {
+        const initRes = await this.createSpeedtestJob(frontID, landingIDs);
+        onResult({ type: 'connected' });
+        let lastSeq = 0;
+
+        const poll = async () => {
+          if (!active) return;
+          try {
+            const data = await this.getSpeedtestJob(initRes.job_id, lastSeq);
+            if (!active) return;
+
+            if (data.results && data.results.length > 0) {
+              for (const r of data.results) {
+                if (r.seq && r.seq > lastSeq) {
+                  lastSeq = r.seq;
+                }
+                onResult(r);
+              }
+            }
+
+            if (data.status === 'finished' || data.status === 'failed' || data.status === 'cancelled') {
+              onComplete();
+              return;
+            }
+
+            pollTimer = setTimeout(poll, 400);
+          } catch (err: any) {
+            if (!active) return;
+            console.error('Speedtest poll error:', err);
+            onError(err.message || '测速轮询失败');
+            onComplete();
+          }
+        };
+
+        pollTimer = setTimeout(poll, 200);
+      } catch (err: any) {
+        if (!active) return;
+        onError(err.message || '启动测速任务失败');
+        onComplete();
+      }
+    })();
+
+    return () => {
+      active = false;
+      if (pollTimer) clearTimeout(pollTimer);
+    };
   }
 
   // --- Speedtest SSE ---

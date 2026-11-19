@@ -31,6 +31,7 @@ export interface Node {
   last_delay: number;
   last_checked_at?: string;
   active: boolean;
+  pending_confirmation?: boolean;
 }
 
 export interface Chain {
@@ -52,6 +53,27 @@ export interface Chain {
 
   frontend_node?: Node;
   landing_node?: Node;
+  frontend_node_status?: 'ok' | 'missing' | 'invalid_pool' | 'direct';
+  landing_node_status?: 'ok' | 'missing' | 'invalid_pool';
+}
+
+export interface ChainDiagnosis {
+  chain_id: string;
+  frontend_ok: boolean;
+  frontend_delay: number;
+  frontend_status: string;
+  landing_ok: boolean;
+  landing_delay: number;
+  landing_status: string;
+  chain_ok: boolean;
+  chain_delay: number;
+  port_ok: boolean;
+  port_error?: string;
+  egress_ip?: string;
+  egress_country?: string;
+  egress_error?: string;
+  diagnosis_summary: string;
+  suggested_action: string;
 }
 
 export interface ConfigDiff {
@@ -63,12 +85,36 @@ export interface ConfigDiff {
   changes: string[];
 }
 
-export interface SpeedtestResult {
+export interface SpeedtestItemResult {
+  seq?: number;
   type: 'connected' | 'front_delay' | 'landing_delay' | 'done' | 'error';
   node_id?: string;
   original_name?: string;
   delay?: number;
   frontend_delay?: number;
+  status?: 'SUCCESS' | 'TIMEOUT' | 'HANDSHAKE_FAILED' | 'REFUSED' | 'TARGET_UNREACHABLE' | 'UNVERIFIED_COMBO' | 'ERROR';
+  status_label?: string;
   timestamp?: number;
   message?: string;
+}
+
+export type SpeedtestResult = SpeedtestItemResult;
+
+export interface SpeedtestJobResponse {
+  job_id: string;
+  status: 'running' | 'finished' | 'cancelled' | 'failed';
+  total: number;
+  completed: number;
+  last_seq: number;
+  results: SpeedtestItemResult[];
+  error?: string;
+}
+
+export interface MigrationReport {
+  total_parsed: number;
+  inherited: number;
+  added: number;
+  deprecated: number;
+  conflicts: number;
+  details?: string[];
 }

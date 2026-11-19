@@ -10,12 +10,43 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"proxybox/internal/store"
 
 	"golang.org/x/crypto/bcrypt"
 )
+
+type LoginRateLimiter struct {
+	mu       sync.Mutex
+	attempts map[string][]time.Time
+}
+
+func NewLoginRateLimiter() *LoginRateLimiter {
+	return &LoginRateLimiter{attempts: make(map[string][]time.Time)}
+}
+
+func (l *LoginRateLimiter) IsAllowed(ip string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := time.Now()
+	cutoff := now.Add(-1 * time.Minute)
+	var valid []time.Time
+	for _, t := range l.attempts[ip] {
+		if t.After(cutoff) {
+			valid = append(valid, t)
+		}
+	}
+	l.attempts[ip] = valid
+	return len(valid) < 5
+}
+
+func (l *LoginRateLimiter) RecordFailed(ip string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.attempts[ip] = append(l.attempts[ip], time.Now())
+}
 
 type AuthService struct {
 	store     *store.Store

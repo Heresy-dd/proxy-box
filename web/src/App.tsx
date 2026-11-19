@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { Navbar } from './components/Navbar';
-import { PoolManager } from './components/PoolManager';
-import { CanvasChain } from './components/CanvasChain';
+import { UnassignedPool } from './components/UnassignedPool';
+import { TriColumnCanvas } from './components/TriColumnCanvas';
 import { SubscriptionModal } from './components/SubscriptionModal';
 import { ApplyDiffModal } from './components/ApplyDiffModal';
 import { SettingsModal } from './components/SettingsModal';
@@ -32,6 +32,7 @@ export const App: React.FC = () => {
   const [selectedFrontendId, setSelectedFrontendId] = useState<string | null>(null);
   const [speedtesting, setSpeedtesting] = useState(false);
   const [landingDelays, setLandingDelays] = useState<Record<string, number>>({});
+  const [landingStatusLabels, setLandingStatusLabels] = useState<Record<string, string>>({});
   const [frontDelay, setFrontDelay] = useState<number | null>(null);
 
   // Initial Load
@@ -71,7 +72,7 @@ export const App: React.FC = () => {
       }
       await refreshAllData();
     } catch {
-      // Server error or unreachable, offer mock
+      // Server error or unreachable, fallback to mock preview
       setIsMock(true);
       ApiClient.useMock = true;
       await refreshAllData();
@@ -155,14 +156,16 @@ export const App: React.FC = () => {
     await refreshAllData();
   };
 
-  // Speedtest
+  // Speedtest using Job runner with polling & SSE fallback
   const handleStartSpeedtest = (frontId: string) => {
     setSpeedtesting(true);
     setLandingDelays({});
+    setLandingStatusLabels({});
     setFrontDelay(null);
 
-    const closeStream = ApiClient.connectSpeedtest(
+    const cancelFn = ApiClient.runSpeedtestJob(
       frontId,
+      undefined,
       (res) => {
         if (res.type === 'front_delay' && res.delay !== undefined) {
           setFrontDelay(res.delay);
@@ -171,12 +174,19 @@ export const App: React.FC = () => {
             ...prev,
             [res.node_id!]: res.delay!,
           }));
-        } else if (res.type === 'done' || res.type === 'error') {
-          setSpeedtesting(false);
+          if (res.status_label) {
+            setLandingStatusLabels((prev) => ({
+              ...prev,
+              [res.node_id!]: res.status_label!,
+            }));
+          }
         }
       },
+      () => {
+        setSpeedtesting(false);
+      },
       (err) => {
-        alert(err);
+        console.warn('Speedtest error:', err);
         setSpeedtesting(false);
       }
     );
@@ -216,10 +226,11 @@ export const App: React.FC = () => {
   };
 
   return (
-    <div className="min-h-screen flex flex-col bg-slate-950 text-slate-100 pb-16">
-      {/* Top Navbar */}
+    <div className="min-h-screen flex flex-col bg-slate-950 text-slate-100 pb-16 font-sans">
+      {/* Top Sticky Navbar */}
       <Navbar
         diff={diff}
+        subscriptions={subscriptions}
         onOpenSubscriptions={() => setSubModalOpen(true)}
         onOpenSettings={() => setSettingsModalOpen(true)}
         onOpenApply={() => setApplyModalOpen(true)}
@@ -229,46 +240,33 @@ export const App: React.FC = () => {
       />
 
       {/* Main Container */}
-      <main className="flex-1 max-w-7xl w-full mx-auto px-6 py-6 space-y-6">
-        {/* Top: 3-Pool Manager Area */}
+      <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 py-6 space-y-6">
+        {/* Top: Collapsible Unassigned Pool */}
         <section>
-          <div className="mb-2 flex items-center justify-between">
-            <h2 className="text-sm font-bold uppercase tracking-wider text-slate-400">
-              节点归类与排序（未归类 · 前置池 · 住宅池）
-            </h2>
-            <span className="text-xs text-slate-500">
-              支持多选框选/Ctrl批量移动 · 池内持久化拖拽排序 · 选中前置实时链式测速
-            </span>
-          </div>
-
-          <PoolManager
-            unassigned={unassignedNodes}
-            frontend={frontendNodes}
-            landing={landingNodes}
-            selectedFrontendId={selectedFrontendId}
-            onSelectFrontend={setSelectedFrontendId}
+          <UnassignedPool
+            nodes={unassignedNodes}
             onMoveNodes={handleMoveNodes}
-            onReorderPool={handleReorderPool}
-            onToggleFavorite={handleToggleFavorite}
-            onStartSpeedtest={handleStartSpeedtest}
-            speedtesting={speedtesting}
-            landingDelays={landingDelays}
-            frontDelay={frontDelay}
           />
         </section>
 
-        {/* Bottom: Visual Canvas Area */}
+        {/* Center: 3 Parallel Columns on the Same Horizon */}
         <section>
-          <CanvasChain
+          <TriColumnCanvas
             chains={chains}
             frontendNodes={frontendNodes}
             landingNodes={landingNodes}
+            selectedFrontendId={selectedFrontendId}
+            onSelectFrontend={setSelectedFrontendId}
             onAddChain={handleAddChain}
             onUpdateChain={handleUpdateChain}
             onDeleteChain={handleDeleteChain}
             onDetectEgress={handleDetectEgress}
-            selectedFrontendId={selectedFrontendId}
-            onSelectFrontend={setSelectedFrontendId}
+            onToggleFavorite={handleToggleFavorite}
+            onStartSpeedtest={handleStartSpeedtest}
+            speedtesting={speedtesting}
+            landingDelays={landingDelays}
+            landingStatusLabels={landingStatusLabels}
+            frontDelay={frontDelay}
           />
         </section>
       </main>

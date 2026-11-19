@@ -58,7 +58,7 @@ func (h *SubHandler) Refresh(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sub, err := h.subService.RefreshSubscription(id)
+	sub, report, err := h.subService.RefreshSubscription(id)
 	if err != nil {
 		// Return updated subscription with error status
 		w.Header().Set("Content-Type", "application/json")
@@ -69,7 +69,10 @@ func (h *SubHandler) Refresh(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	jsonResponse(w, sub)
+	jsonResponse(w, map[string]interface{}{
+		"subscription": sub,
+		"migration":    report,
+	})
 }
 
 func (h *SubHandler) Delete(w http.ResponseWriter, r *http.Request) {

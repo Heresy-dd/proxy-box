@@ -118,7 +118,7 @@ func TestPoolAndChainAPIs(t *testing.T) {
 		RawConfig:    map[string]interface{}{"name": "落地节点1", "type": "ss", "server": "1.2.3.4", "port": 8388},
 		Pool:         model.PoolUnassigned,
 	}
-	_ = dbStore.UpsertNodes("sub-test", "住宅", []*model.Node{node1})
+	_, _ = dbStore.UpsertNodes("sub-test", "住宅", []*model.Node{node1})
 
 	// 1. Move node1 to landing pool
 	moveBody := bytes.NewBufferString(`{"node_ids":["test-node-1"],"target_pool":"landing"}`)

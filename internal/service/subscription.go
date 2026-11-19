@@ -109,7 +109,7 @@ func (svc *SubscriptionService) AddSubscription(name, urlStr string, interval in
 	}
 
 	if len(nodes) > 0 {
-		if err := svc.store.UpsertNodes(subID, name, nodes); err != nil {
+		if _, err := svc.store.UpsertNodes(subID, name, nodes); err != nil {
 			return nil, err
 		}
 	}
@@ -118,10 +118,10 @@ func (svc *SubscriptionService) AddSubscription(name, urlStr string, interval in
 }
 
 // RefreshSubscription updates subscription content; on failure preserves previous nodes
-func (svc *SubscriptionService) RefreshSubscription(id string) (*model.Subscription, error) {
+func (svc *SubscriptionService) RefreshSubscription(id string) (*model.Subscription, *model.MigrationReport, error) {
 	sub, err := svc.store.GetSubscription(id)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	nodes, upload, download, total, expire, rawContent, err := svc.FetchAndParse(sub.ID, sub.Name, sub.URL)
@@ -131,7 +131,7 @@ func (svc *SubscriptionService) RefreshSubscription(id string) (*model.Subscript
 		sub.ErrorMessage = fmt.Sprintf("Refresh failed at %s: %v", time.Now().Format("15:04:05"), err)
 		sub.LastUpdatedAt = time.Now()
 		_ = svc.store.SaveSubscription(sub)
-		return sub, err
+		return sub, nil, err
 	}
 
 	sub.Status = "active"
@@ -144,14 +144,15 @@ func (svc *SubscriptionService) RefreshSubscription(id string) (*model.Subscript
 	sub.LastUpdatedAt = time.Now()
 
 	if err := svc.store.SaveSubscription(sub); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	if err := svc.store.UpsertNodes(sub.ID, sub.Name, nodes); err != nil {
-		return nil, err
+	report, err := svc.store.UpsertNodes(sub.ID, sub.Name, nodes)
+	if err != nil {
+		return nil, nil, err
 	}
 
-	return sub, nil
+	return sub, report, nil
 }
 
 // StartAutoRefresh starts background ticker for subscription updates
@@ -176,7 +177,7 @@ func (svc *SubscriptionService) StartAutoRefresh() {
 					}
 					nextUpdate := sub.LastUpdatedAt.Add(time.Duration(sub.UpdateInterval) * time.Minute)
 					if now.After(nextUpdate) {
-						_, _ = svc.RefreshSubscription(sub.ID)
+						_, _, _ = svc.RefreshSubscription(sub.ID)
 					}
 				}
 			}

@@ -33,7 +33,15 @@ func SetupRouter(deps RouterDependencies) http.Handler {
 	r.Use(middleware.RealIP)
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
-	r.Use(middleware.Timeout(60 * time.Second))
+	r.Use(func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if strings.HasSuffix(r.URL.Path, "/speedtest/stream") {
+				next.ServeHTTP(w, r)
+				return
+			}
+			middleware.Timeout(60 * time.Second)(next).ServeHTTP(w, r)
+		})
+	})
 
 	// CORS for frontend Vite development
 	r.Use(cors.Handler(cors.Options{
@@ -51,6 +59,7 @@ func SetupRouter(deps RouterDependencies) http.Handler {
 	speedtestHandler := NewSpeedtestHandler(deps.SpeedtestSvc)
 	applyHandler := NewApplyHandler(deps.Store, deps.ApplyService)
 	settingsHandler := NewSettingsHandler(deps.Store, deps.ApplyService)
+	loginLimiter := NewLoginRateLimiter()
 
 	// API Routes
 	r.Route("/api", func(api chi.Router) {
@@ -76,6 +85,11 @@ func SetupRouter(deps RouterDependencies) http.Handler {
 		})
 
 		api.Post("/auth/login", func(w http.ResponseWriter, r *http.Request) {
+			ip := r.RemoteAddr
+			if !loginLimiter.IsAllowed(ip) {
+				jsonError(w, "登录尝试次数过多，请稍后再试", http.StatusTooManyRequests)
+				return
+			}
 			var req struct {
 				Password string `json:"password"`
 			}
@@ -84,6 +98,7 @@ func SetupRouter(deps RouterDependencies) http.Handler {
 				return
 			}
 			if !deps.Auth.VerifyPassword(req.Password) {
+				loginLimiter.RecordFailed(ip)
 				jsonError(w, "invalid password", http.StatusUnauthorized)
 				return
 			}
@@ -114,8 +129,11 @@ func SetupRouter(deps RouterDependencies) http.Handler {
 			protected.Put("/chains/{id}", chainHandler.Update)
 			protected.Delete("/chains/{id}", chainHandler.Delete)
 			protected.Post("/chains/{id}/egress-check", chainHandler.DetectEgress)
+			protected.Post("/chains/{id}/diagnose", chainHandler.Diagnose)
 
-			// Speedtest (SSE stream)
+			// Speedtest (Job polling & SSE stream)
+			protected.Post("/speedtest/jobs", speedtestHandler.CreateJob)
+			protected.Get("/speedtest/jobs/{id}", speedtestHandler.GetJob)
 			protected.Get("/speedtest/stream", speedtestHandler.Stream)
 
 			// Apply & Rollback

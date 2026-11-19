@@ -144,3 +144,19 @@ func (h *ChainHandler) DetectEgress(w http.ResponseWriter, r *http.Request) {
 		"country": country,
 	})
 }
+
+func (h *ChainHandler) Diagnose(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	if id == "" {
+		jsonError(w, "id required", http.StatusBadRequest)
+		return
+	}
+
+	diag, err := h.chainService.DiagnoseChain(id)
+	if err != nil {
+		jsonError(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	jsonResponse(w, diag)
+}

@@ -4,6 +4,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"regexp"
+	"strings"
 	"time"
 )
 
@@ -49,8 +51,19 @@ type Node struct {
 	Order          int                    `json:"order"`
 	IsFavorite     bool                   `json:"is_favorite"`
 	LastDelay      int                    `json:"last_delay"` // ms, 0 means not tested
-	LastCheckedAt  time.Time              `json:"last_checked_at"`
-	Active         bool                   `json:"active"` // whether still in subscription
+	LastCheckedAt       time.Time              `json:"last_checked_at"`
+	Active              bool                   `json:"active"` // whether still in subscription
+	PendingConfirmation bool                   `json:"pending_confirmation"`
+}
+
+// MigrationReport records node inheritance and changes after subscription update
+type MigrationReport struct {
+	TotalParsed int      `json:"total_parsed"`
+	Inherited   int      `json:"inherited"`
+	Added       int      `json:"added"`
+	Deprecated  int      `json:"deprecated"`
+	Conflicts   int      `json:"conflicts"`
+	Details     []string `json:"details,omitempty"`
 }
 
 // GenerateStableNodeID creates a deterministic ID for a node
@@ -58,6 +71,17 @@ func GenerateStableNodeID(subID, originalName, server string, port int) string {
 	raw := fmt.Sprintf("%s:%s:%s:%d", subID, originalName, server, port)
 	h := sha256.Sum256([]byte(raw))
 	return hex.EncodeToString(h[:12]) // 24-character stable hex ID
+}
+
+// NormalizeNodeName strips common prefixes (CNIX专线 · ) and trailing multipliers (X3, X2.5) for cross-revision matching
+func NormalizeNodeName(name string) string {
+	s := strings.TrimSpace(name)
+	// Remove common subscription prefixes like "CNIX专线 · ", "CNIX专线·", "CNIX专线 "
+	s = regexp.MustCompile(`(?i)^cnix专线\s*[·\-\s]\s*`).ReplaceAllString(s, "")
+	// Remove trailing multipliers like " X3", " X2.5", " X1.5", " X30.5", " X30", "【2x】", "【1x】"
+	s = regexp.MustCompile(`(?i)\s*x\d+(\.\d+)?\s*$`).ReplaceAllString(s, "")
+	s = regexp.MustCompile(`(?i)\s*【\d+x】\s*$`).ReplaceAllString(s, "")
+	return strings.TrimSpace(s)
 }
 
 // Chain represents a mapped proxy port: Client -> Port -> FrontendNode (optional) -> LandingNode -> Internet
@@ -79,8 +103,29 @@ type Chain struct {
 	UpdatedAt       time.Time `json:"updated_at"`
 
 	// Joined fields for display
-	FrontendNode *Node `json:"frontend_node,omitempty"`
-	LandingNode  *Node `json:"landing_node,omitempty"`
+	FrontendNode       *Node  `json:"frontend_node,omitempty"`
+	LandingNode        *Node  `json:"landing_node,omitempty"`
+	FrontendNodeStatus string `json:"frontend_node_status,omitempty"` // "ok", "missing", "invalid_pool", "direct"
+	LandingNodeStatus  string `json:"landing_node_status,omitempty"`  // "ok", "missing", "invalid_pool"
+}
+
+type ChainDiagnosis struct {
+	ChainID          string `json:"chain_id"`
+	FrontendOK       bool   `json:"frontend_ok"`
+	FrontendDelay    int    `json:"frontend_delay"`
+	FrontendStatus   string `json:"frontend_status"` // "ok", "missing", "direct", "offline"
+	LandingOK        bool   `json:"landing_ok"`
+	LandingDelay     int    `json:"landing_delay"`
+	LandingStatus    string `json:"landing_status"` // "ok", "missing", "offline"
+	ChainOK          bool   `json:"chain_ok"`
+	ChainDelay       int    `json:"chain_delay"`
+	PortOK           bool   `json:"port_ok"`
+	PortError        string `json:"port_error,omitempty"`
+	EgressIP         string `json:"egress_ip,omitempty"`
+	EgressCountry    string `json:"egress_country,omitempty"`
+	EgressError      string `json:"egress_error,omitempty"`
+	DiagnosisSummary string `json:"diagnosis_summary"`
+	SuggestedAction  string `json:"suggested_action"`
 }
 
 // ConfigVersion tracks mihomo configuration history for rollback

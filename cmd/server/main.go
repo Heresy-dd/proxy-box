@@ -83,6 +83,7 @@ func main() {
 
 	chainService := service.NewChainService(dbStore)
 	speedtestService := service.NewSpeedtestService(dbStore, binPath, probeWorkDir, *probePort, controllerSecret)
+	chainService.SetSpeedtestService(speedtestService)
 	applyService := service.NewApplyService(dbStore, binPath, prodWorkDir, *prodPort, controllerSecret)
 
 	webFS, _ := proxybox.GetFrontendFS()
@@ -99,10 +100,11 @@ func main() {
 	})
 
 	server := &http.Server{
-		Addr:         *addr,
-		Handler:      router,
-		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 60 * time.Second,
+		Addr:              *addr,
+		Handler:           router,
+		ReadHeaderTimeout: 15 * time.Second,
+		ReadTimeout:       60 * time.Second,
+		WriteTimeout:      0, // 0 for long-lived SSE connections
 	}
 
 	go func() {
